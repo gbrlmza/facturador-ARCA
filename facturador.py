@@ -15,6 +15,7 @@ import re
 import csv
 import io
 import json
+import html
 import base64
 import logging
 import smtplib
@@ -115,6 +116,12 @@ SMTP_HOST = os.environ.get("SMTP_HOST", "smtp.gmail.com")
 SMTP_PORT = int(os.environ.get("SMTP_PORT", "465"))
 SMTP_USER = os.environ.get("SMTP_USER")
 SMTP_PASS = os.environ.get("SMTP_PASS")
+
+# Timeout de red (segundos). Sin esto, socket.getdefaulttimeout() es None y
+# una descarga o un SMTP que no responde cuelga el bot para siempre (todo el
+# I/O es sincrono sobre el event loop). Ver tambien TIMEOUT_SOCKET_GLOBAL en
+# bot_telegram.py, que cubre las llamadas del SDK de ARCA.
+TIMEOUT_RED = int(os.environ.get("TIMEOUT_RED", "60"))
 
 # Receptor default: consumidor final anonimo (sin doc). Es el caso del ~70-95%
 # de las facturas. cliente_id NULL en la tabla significa exactamente esto.
@@ -310,6 +317,21 @@ def descripcion_receptor(ud: dict) -> str:
 # ---------------------------------------------------------------------------
 # Emision en ARCA
 # ---------------------------------------------------------------------------
+class EmisionFallida(Exception):
+    """Fallo al pedir el CAE, conservando el contexto del comprobante.
+
+    La distincion que importa: un error puede ser un RECHAZO de ARCA (no se
+    emitio nada, se puede reintentar) o una falla de TRANSPORTE posterior a la
+    autorizacion (la factura existe y nos quedamos sin el CAE). Desde afuera
+    se ven igual. `res_parcial` guarda todo lo del comprobante menos el CAE,
+    para poder preguntarle a ARCA cual de las dos fue: recuperar_emision().
+    """
+
+    def __init__(self, mensaje: str, res_parcial: dict):
+        super().__init__(mensaje)
+        self.res_parcial = res_parcial
+
+
 def get_afip() -> Afip:
     opciones = {"CUIT": CUIT, "production": PRODUCTION}
     if AFIP_ACCESS_TOKEN:
@@ -409,13 +431,73 @@ def emitir_factura_c(importe_total: float, doc_tipo: int, doc_nro: int,
             "Cuit": str(CUIT),
         }]
 
-    res = afip.ElectronicBilling.createVoucher(data)
-    res["numero"] = numero
-    res["fecha_int"] = fecha_int
-    res["serv_desde_int"] = desde_int
-    res["serv_hasta_int"] = hasta_int
-    res["cbte_tipo"] = cbte_tipo
-    res["asociado_nro"] = asociado_nro
+    # Todo lo que define al comprobante menos el CAE. Si la llamada falla, esto
+    # es lo que permite preguntarle a ARCA si igual quedo autorizado.
+    res_parcial = {
+        "numero": numero,
+        "fecha_int": fecha_int,
+        "serv_desde_int": desde_int,
+        "serv_hasta_int": hasta_int,
+        "cbte_tipo": cbte_tipo,
+        "asociado_nro": asociado_nro,
+        "imp_total": importe_total,
+    }
+
+    try:
+        res = afip.ElectronicBilling.createVoucher(data)
+    except Exception as e:
+        # NO reintentar sin pasar antes por recuperar_emision(): si el error
+        # fue de transporte, la factura ya existe y el reintento emitiria una
+        # segunda por la misma operacion (WSFE no deduplica).
+        raise EmisionFallida(str(e), res_parcial) from e
+
+    res.update(res_parcial)
+    return res
+
+
+def recuperar_emision(res_parcial: dict) -> dict | None:
+    """¿ARCA autorizó el comprobante, pese al error que nos volvió?
+
+    Se llama SOLO despues de un EmisionFallida. Devuelve el `res` completo
+    (listo para guardar_factura / generar_pdf) si el comprobante quedo
+    emitido, o None si ARCA nunca lo autorizo (rechazo genuino: se puede
+    reintentar). Lanza excepcion si no se puede determinar — en ese caso el
+    que llama NO debe habilitar el reintento.
+    """
+    numero = res_parcial["numero"]
+    cbte_tipo = res_parcial.get("cbte_tipo", FACTURA_C)
+    afip = get_afip()
+
+    if afip.ElectronicBilling.getLastVoucher(PUNTO_DE_VENTA, cbte_tipo) < numero:
+        return None                     # ARCA no llego a autorizarlo
+
+    info = afip.ElectronicBilling.getVoucherInfo(numero, PUNTO_DE_VENTA, cbte_tipo)
+    datos = (info or {}).get("ResultGet") or {}
+
+    # Guarda contra recuperar un comprobante ajeno: en homologacion el CUIT de
+    # testing es compartido y el numerador lo mueve cualquiera.
+    imp_arca = float(datos.get("ImpTotal") or 0)
+    imp_nuestro = float(res_parcial.get("imp_total") or 0)
+    if imp_nuestro and imp_arca and abs(imp_arca - imp_nuestro) > 0.01:
+        raise RuntimeError(
+            f"El comprobante {numero} existe en ARCA pero por ${imp_arca:,.2f}, "
+            f"no por los ${imp_nuestro:,.2f} que intentaste emitir. No lo toco: "
+            f"revisalo a mano en Mis Comprobantes."
+        )
+
+    # FECompConsultar devuelve el CAE en CodAutorizacion y su vencimiento en
+    # FchVto (yyyymmdd). Se aceptan tambien los nombres de FECAESolicitar.
+    cae = str(datos.get("CodAutorizacion") or datos.get("CAE") or "").strip()
+    vto = str(datos.get("FchVto") or datos.get("CAEFchVto") or "").strip()
+    if not cae:
+        raise RuntimeError(
+            f"ARCA dice que el {numero} está autorizado, pero no pude leer el "
+            f"CAE de la respuesta (claves recibidas: {sorted(datos)[:12]})."
+        )
+
+    res = dict(res_parcial)
+    res["CAE"] = cae
+    res["CAEFchVto"] = _fecha_int_a_iso(vto) if vto.isdigit() and len(vto) == 8 else vto
     return res
 
 
@@ -519,7 +601,7 @@ def es_email(texto: str) -> bool:
 
 
 def descargar_pdf(url: str) -> bytes:
-    with urllib.request.urlopen(url) as r:
+    with urllib.request.urlopen(url, timeout=TIMEOUT_RED) as r:
         return r.read()
 
 
@@ -548,7 +630,7 @@ def enviar_factura_email(destinatario: str, res: dict, pdf: bytes) -> None:
     msg.add_attachment(pdf, maintype="application", subtype="pdf",
                        filename=f"{nombre_pdf(res)}.pdf")
 
-    with smtplib.SMTP_SSL(SMTP_HOST, SMTP_PORT) as smtp:
+    with smtplib.SMTP_SSL(SMTP_HOST, SMTP_PORT, timeout=TIMEOUT_RED) as smtp:
         smtp.login(SMTP_USER, SMTP_PASS)
         smtp.send_message(msg)
 
@@ -751,12 +833,37 @@ def csv_periodo(desde: date, hasta: date) -> bytes | None:
 
 
 def total_facturado_12m() -> float:
-    """Facturado neto (facturas - NC) de los ultimos 12 meses, como mira ARCA."""
+    """Facturado neto (facturas - NC) de los ultimos 12 meses, como mira ARCA.
+
+    Con piso en 0: una NC puede anular una factura emitida ANTES de la ventana
+    de 12 meses, y ahi el neto se iria a negativo. Un devengado negativo no
+    significa nada y apagaria en silencio la alerta de tope (aviso_tope).
+    """
     filas = filas_periodo(hoy_ar() - timedelta(days=365), hoy_ar())
-    return sum(
+    neto = sum(
         float(f["imp_total"]) * (-1 if f["cbte_tipo"] == NOTA_CREDITO_C else 1)
         for f in filas
     )
+    return max(0.0, neto)
+
+
+def acreditado_por_nc(factura_nro: int) -> float:
+    """Suma de las NC ya emitidas contra esa factura (0 si no hay ninguna).
+
+    ARCA NO valida que las NC no superen el comprobante asociado: la unica
+    red es esta. Sin acumular, N notas parciales pasan cada una el control
+    de "no supera el total" y terminan acreditando de mas.
+    """
+    if supabase is None:
+        raise RuntimeError("Supabase no configurado")
+    res = (
+        supabase.table("facturas_emitidas").select("imp_total")
+        .eq("pto_vta", PUNTO_DE_VENTA)
+        .eq("cbte_tipo", NOTA_CREDITO_C)
+        .eq("asociado_cbte_nro", factura_nro)
+        .execute()
+    )
+    return sum(float(f["imp_total"]) for f in res.data)
 
 
 def aviso_umbral(monto: float, doc_tipo: int) -> str | None:
@@ -813,6 +920,17 @@ def url_qr_arca(res: dict, ud: dict) -> str:
     return f"https://www.afip.gob.ar/fe/qr/?p={payload}"
 
 
+def _esc(valor) -> str:
+    """Escapa texto libre antes de meterlo en el HTML del PDF.
+
+    Todo lo que sale de teclado o del .env pasa por aca: un cliente que se
+    llame "Pérez & Cía" genera HTML invalido, y un "<" rompe el render del
+    comprobante. Los datos generados por el codigo (fechas, importes, numeros)
+    no lo necesitan.
+    """
+    return html.escape(str(valor), quote=False)
+
+
 def _html_factura(res: dict, ud: dict) -> str:
     def _fmt(fecha_int: int) -> str:
         return datetime.strptime(str(fecha_int), "%Y%m%d").strftime("%d/%m/%Y")
@@ -856,12 +974,26 @@ def _html_factura(res: dict, ud: dict) -> str:
     )
     linea_nombre = (
         f'<div class="fila"><b>Apellido y Nombre / Razón Social:</b> '
-        f'{receptor_nombre}</div>'
+        f'{_esc(receptor_nombre)}</div>'
         if receptor_nombre else ""
     )
 
     total = fmt_ars(ud["monto"])
-    descripcion = ud.get("descripcion") or FACTURA_DESCRIPCION
+    descripcion = _esc(ud.get("descripcion") or FACTURA_DESCRIPCION)
+
+    # En homologacion el comprobante NO tiene validez fiscal, y eso tiene que
+    # cantar a simple vista: el PDF es lo unico que sale para afuera, y ni /pdf
+    # ni /mail avisan en que modo estan. Doble senial a proposito (barra +
+    # marca de agua) para que siga siendo obvio si el render se come el
+    # transform o la opacidad.
+    # OJO: depende del modo del PROCESO, no de la fila — el log todavia no
+    # guarda con que entorno se emitio cada comprobante.
+    if PRODUCTION:
+        etiqueta_original = "ORIGINAL"
+        marca_agua = ""
+    else:
+        etiqueta_original = "COMPROBANTE DE PRUEBA — HOMOLOGACIÓN — SIN VALIDEZ FISCAL"
+        marca_agua = '<div class="marca">SIN VALIDEZ FISCAL</div>'
 
     bloque_logo = ""
     if LOGO_PATH:
@@ -877,9 +1009,16 @@ def _html_factura(res: dict, ud: dict) -> str:
 <style>
   * {{ margin: 0; padding: 0; box-sizing: border-box; }}
   body {{ font-family: Helvetica, Arial, sans-serif; font-size: 11px; color: #111; }}
-  .marco {{ border: 1px solid #111; }}
+  .marco {{ border: 1px solid #111; position: relative; }}
   .original {{ text-align: center; font-weight: bold; font-size: 13px;
                padding: 4px; border-bottom: 1px solid #111; }}
+  /* Solo en homologacion. Si el renderer ignora transform u opacity, el texto
+     igual sale grande y rojo: degrada visible, nunca invisible. */
+  .marca {{ position: absolute; top: 50%; left: 50%;
+            transform: translate(-50%, -50%) rotate(-28deg);
+            font-size: 44px; font-weight: bold; color: #d00; opacity: 0.20;
+            white-space: nowrap; letter-spacing: 2px;
+            border: 5px solid #d00; padding: 12px 28px; }}
   .cabecera {{ display: flex; position: relative; border-bottom: 1px solid #111; }}
   .col {{ width: 50%; padding: 14px; }}
   .col-izq {{ border-right: 1px solid #111; }}
@@ -902,14 +1041,15 @@ def _html_factura(res: dict, ud: dict) -> str:
   .cae {{ margin-left: auto; text-align: right; }}
 </style>
 <div class="marco">
-  <div class="original">ORIGINAL</div>
+  {marca_agua}
+  <div class="original">{etiqueta_original}</div>
   <div class="cabecera">
     <div class="letra"><div class="c">C</div><div class="cod">{codigo}</div></div>
     <div class="col col-izq">
       {bloque_logo}
-      <h1>{EMISOR_NOMBRE}</h1>
-      <div class="fila"><b>Razón Social:</b> {EMISOR_NOMBRE}</div>
-      <div class="fila"><b>Domicilio Comercial:</b> {EMISOR_DOMICILIO}</div>
+      <h1>{_esc(EMISOR_NOMBRE)}</h1>
+      <div class="fila"><b>Razón Social:</b> {_esc(EMISOR_NOMBRE)}</div>
+      <div class="fila"><b>Domicilio Comercial:</b> {_esc(EMISOR_DOMICILIO)}</div>
       <div class="fila"><b>Condición frente al IVA:</b> Responsable Monotributo</div>
     </div>
     <div class="col col-der">
@@ -918,7 +1058,7 @@ def _html_factura(res: dict, ud: dict) -> str:
         &nbsp;&nbsp;<b>Comp. Nro:</b> {res['numero']:08d}</div>
       <div class="fila"><b>Fecha de Emisión:</b> {fecha}</div>
       <div class="fila"><b>CUIT:</b> {CUIT}</div>
-      <div class="fila"><b>Inicio de Actividades:</b> {EMISOR_INICIO_ACTIVIDADES}</div>
+      <div class="fila"><b>Inicio de Actividades:</b> {_esc(EMISOR_INICIO_ACTIVIDADES)}</div>
     </div>
   </div>
   {bloque_periodo}

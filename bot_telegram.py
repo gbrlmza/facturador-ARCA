@@ -33,6 +33,7 @@ Variables de entorno propias de esta capa (el resto las lee facturador.py):
 """
 
 import os
+import socket
 import logging
 from datetime import date, time as dtime, timedelta
 from decimal import InvalidOperation
@@ -64,6 +65,14 @@ MI_CHAT_ID = int(os.environ["MI_CHAT_ID"]) if os.environ.get("MI_CHAT_ID") else 
  PIDIENDO_NOMBRE) = range(11)
 
 LOTE_MAX = 10                  # tope de facturas por /lote, contra el fat-finger
+
+# Red de seguridad para el SDK de ARCA: abre http.client.HTTPSConnection SIN
+# timeout, asi que una conexion colgada bloquea el bot para siempre (todo el
+# I/O es sincrono sobre el event loop). Se setea a nivel proceso porque no hay
+# forma de pasarle el timeout al SDK. Generoso a proposito: el createPDF puede
+# tardar. No afecta a Telegram ni a Supabase, que van por httpx con timeout
+# propio. Peor aun que colgarse: no saber si la factura se emitio o no.
+TIMEOUT_SOCKET_GLOBAL = int(os.environ.get("TIMEOUT_SOCKET_GLOBAL", "180"))
 
 MENSAJE_USO_PERIODO = (
     "No entendí el período. Ejemplos:\n"
@@ -439,6 +448,48 @@ async def recibir_nombre(update: Update, context: ContextTypes.DEFAULT_TYPE):
     return await mostrar_preview(update.message, ud)
 
 
+async def _resolver_emision_fallida(mensaje, e: fac.EmisionFallida) -> dict | None:
+    """Ante un fallo de emisión: ¿rechazo, o quedó emitida y perdimos el CAE?
+
+    Le pregunta a ARCA en vez de asumir. Devuelve el `res` recuperado (para
+    seguir con el guardado y el PDF como si nada) o None para abortar. En el
+    caso de aborto responde al usuario: la diferencia entre "reintentá
+    tranquilo" y "NO reintentes" es una factura duplicada.
+    """
+    numero = e.res_parcial["numero"]
+    try:
+        res = fac.recuperar_emision(e.res_parcial)
+    except Exception as e2:
+        logger.error("No pude verificar si el comprobante %s quedó emitido: %s", numero, e2)
+        await mensaje.reply_text(
+            f"❌ Error al emitir en AFIP:\n{e}\n\n"
+            f"🛑 Y TAMPOCO pude verificar contra ARCA si quedó emitida igual:\n{e2}\n\n"
+            f"NO reintentes a ciegas. Corré /ultima primero: si ya estaba "
+            f"emitida y reintentás, emitís una segunda por la misma operación."
+        )
+        return None
+
+    if res is not None:
+        logger.warning("Comprobante %s recuperado tras fallo posterior a la autorización", numero)
+        await mensaje.reply_text(
+            f"⚠️ La llamada a ARCA falló DESPUÉS de autorizar el comprobante.\n\n"
+            f"El N° {numero} SÍ quedó emitido (CAE {res['CAE']}). Lo recuperé y "
+            f"sigo con el guardado — NO lo reintentes."
+        )
+        return res
+
+    mensaje_error = f"❌ Error al emitir en AFIP:\n{e}"
+    if "10016" in str(e):
+        mensaje_error += (
+            "\n\n💡 Este error suele ser por la fecha: no puede ser anterior "
+            "a la de tu último comprobante emitido (numeración cronológica). "
+            "Probá con una fecha más reciente o con hoy."
+        )
+    mensaje_error += "\n\n✅ Verificado contra ARCA: NO quedó emitida. Podés reintentar."
+    await mensaje.reply_text(mensaje_error)
+    return None
+
+
 async def confirmar(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
@@ -460,15 +511,15 @@ async def confirmar(update: Update, context: ContextTypes.DEFAULT_TYPE):
         res = fac.emitir_factura_c(ud["monto"], ud["doc_tipo"], ud["doc_nro"],
                                    ud["cond_iva"], ud.get("fecha") or hoy_ar(),
                                    ud.get("serv_desde"), ud.get("serv_hasta"))
+    except fac.EmisionFallida as e:
+        # Puede haber quedado emitida igual: se le pregunta a ARCA.
+        res = await _resolver_emision_fallida(query.message, e)
+        if res is None:
+            return ConversationHandler.END
     except Exception as e:
-        mensaje_error = f"❌ Error al emitir en AFIP:\n{e}"
-        if "10016" in str(e):
-            mensaje_error += (
-                "\n\n💡 Este error suele ser por la fecha: no puede ser anterior "
-                "a la de tu último comprobante emitido (numeración cronológica). "
-                "Probá con una fecha más reciente o con hoy."
-            )
-        await query.message.reply_text(mensaje_error)
+        # Fallo antes de pedir el CAE (ej: no se pudo leer el último número):
+        # no hay comprobante en juego.
+        await query.message.reply_text(f"❌ Error al emitir en AFIP:\n{e}")
         return ConversationHandler.END
 
     # 2) Guardar en Supabase. Si esto falla, la factura YA existe en AFIP:
@@ -640,11 +691,20 @@ async def confirmar_lote(update: Update, context: ContextTypes.DEFAULT_TYPE):
             res = fac.emitir_factura_c(monto, fac.DOC_TIPO_CF, fac.DOC_NRO_CF,
                                        fac.COND_IVA_CF, fecha,
                                        ud.get("serv_desde"), ud.get("serv_hasta"))
+        except fac.EmisionFallida as e:
+            # Puede haber quedado emitida igual: si se recupera, el lote sigue.
+            res = await _resolver_emision_fallida(query.message, e)
         except Exception as e:
+            await query.message.reply_text(
+                f"❌ Falló la factura {i}/{total} (${fmt_ars(monto)}):\n{e}"
+            )
+            res = None
+
+        if res is None:
             restantes = ", ".join(f"${fmt_ars(m)}" for m in montos[i - 1:])
             await query.message.reply_text(
-                f"❌ Falló la factura {i}/{total} (${fmt_ars(monto)}):\n{e}\n\n"
-                f"Las anteriores SÍ se emitieron. Quedaron sin emitir: {restantes}.\n"
+                f"Corté el lote en la {i}/{total}. Las anteriores SÍ se emitieron.\n"
+                f"Quedaron sin emitir: {restantes}.\n"
                 f"Cuando se resuelva, relanzá el lote solo con esas."
             )
             return ConversationHandler.END
@@ -725,20 +785,50 @@ async def nc(update: Update, context: ContextTypes.DEFAULT_TYPE):
     fila = consulta.data[0]
     monto_original = float(fila["imp_total"])
 
+    # Cuanto de esta factura YA fue acreditado por notas de credito previas.
+    # Sin esto, N notas parciales pasan cada una el control de "no supera el
+    # total" y entre todas acreditan de mas (ARCA no lo valida).
+    try:
+        ya_acreditado = fac.acreditado_por_nc(numero)
+    except Exception as e:
+        await update.message.reply_text(
+            f"❌ No pude verificar las NC previas de la factura {numero}:\n{e}\n\n"
+            "No emito a ciegas: si no puedo controlar el acumulado, podría "
+            "acreditarte de más."
+        )
+        return ConversationHandler.END
+
+    disponible = monto_original - ya_acreditado
+    if disponible <= 0:
+        await update.message.reply_text(
+            f"La Factura N° {numero} (${fmt_ars(monto_original)}) ya está "
+            f"acreditada por completo (${fmt_ars(ya_acreditado)} en NC previas). "
+            f"No queda saldo para acreditar."
+        )
+        return ConversationHandler.END
+
     if len(args) >= 2:
         try:
             monto = fac.parsear_monto(args[1])
         except (InvalidOperation, ArithmeticError, ValueError):
             await update.message.reply_text(f"No entendí el monto «{args[1]}».")
             return ConversationHandler.END
-        if monto > monto_original:
+        if monto > disponible:
+            detalle_previas = (
+                f"\nYa acreditado en NC previas: ${fmt_ars(ya_acreditado)}"
+                if ya_acreditado else ""
+            )
             await update.message.reply_text(
-                f"La NC (${fmt_ars(monto)}) no puede superar el total de la "
-                f"factura (${fmt_ars(monto_original)})."
+                f"La NC (${fmt_ars(monto)}) supera el saldo disponible de la "
+                f"Factura N° {numero}.\n\n"
+                f"Total de la factura: ${fmt_ars(monto_original)}"
+                f"{detalle_previas}\n"
+                f"Disponible para acreditar: ${fmt_ars(disponible)}"
             )
             return ConversationHandler.END
     else:
-        monto = monto_original
+        # Sin monto = anular lo que queda, no el total original.
+        monto = disponible
 
     ud = context.user_data
     ud["nc_asociado"] = numero
@@ -751,7 +841,14 @@ async def nc(update: Update, context: ContextTypes.DEFAULT_TYPE):
         ud["serv_desde"] = date.fromisoformat(fila["fch_serv_desde"])
         ud["serv_hasta"] = date.fromisoformat(fila["fch_serv_hasta"])
 
-    parcial = " (PARCIAL)" if monto < monto_original else " (total)"
+    parcial = " (PARCIAL)" if monto < disponible else " (total)"
+    # Si ya hubo NC contra esta factura, el saldo tiene que estar a la vista:
+    # es la diferencia entre "anulo la factura" y "anulo lo que queda".
+    linea_previas = (
+        f"NC previas: −${fmt_ars(ya_acreditado)}\n"
+        f"Saldo disponible: ${fmt_ars(disponible)}\n"
+        if ya_acreditado else ""
+    )
     botones = InlineKeyboardMarkup([[
         InlineKeyboardButton("✅ Confirmar", callback_data="confirmar"),
         InlineKeyboardButton("❌ Cancelar", callback_data="cancelar"),
@@ -761,6 +858,7 @@ async def nc(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"Nota de Crédito C{parcial}\n"
         f"Anula/ajusta: Factura C N° {numero} (${fmt_ars(monto_original)}, "
         f"{fila['fecha_cbte']})\n"
+        f"{linea_previas}"
         f"Receptor: {descripcion_receptor(ud)}\n"
         f"Monto NC: ${fmt_ars(monto)}\n"
         f"Fecha: hoy\n\n"
@@ -791,6 +889,11 @@ async def confirmar_nc(update: Update, context: ContextTypes.DEFAULT_TYPE):
                                    ud.get("serv_desde"), ud.get("serv_hasta"),
                                    cbte_tipo=fac.NOTA_CREDITO_C,
                                    asociado_nro=ud["nc_asociado"])
+    except fac.EmisionFallida as e:
+        # Una NC duplicada acredita dos veces: mismo cuidado que con la factura.
+        res = await _resolver_emision_fallida(query.message, e)
+        if res is None:
+            return ConversationHandler.END
     except Exception as e:
         await query.message.reply_text(f"❌ Error al emitir la NC en AFIP:\n{e}")
         return ConversationHandler.END
@@ -1078,55 +1181,74 @@ async def recibir_email_suelto(update: Update, context: ContextTypes.DEFAULT_TYP
                               update.message.text.strip())
 
 
+def _reconciliar_tipo(tipo: int, etiqueta: str) -> str:
+    """Un bloque del reporte de /ultima para un tipo de comprobante.
+
+    Compara CONJUNTOS, no maximos: si falla el guardado de la N y despues la
+    N+1 sí se guarda, los maximos vuelven a coincidir y el hueco del medio
+    queda invisible para siempre. Aca aparece.
+    """
+    ultimo_arca = fac.get_afip().ElectronicBilling.getLastVoucher(
+        fac.PUNTO_DE_VENTA, tipo
+    )
+    if fac.supabase is None:
+        return f"{etiqueta}\nARCA: {ultimo_arca}\nSupabase: sin configurar"
+
+    res = (
+        fac.supabase.table("facturas_emitidas")
+        .select("cbte_nro")
+        .eq("pto_vta", fac.PUNTO_DE_VENTA)
+        .eq("cbte_tipo", tipo)
+        .execute()
+    )
+    numeros = {f["cbte_nro"] for f in res.data}
+    ultimo_db = max(numeros) if numeros else 0
+    bloque = f"{etiqueta}\nARCA: {ultimo_arca}\nSupabase: {ultimo_db}"
+
+    if not numeros:
+        if ultimo_arca:
+            bloque += f"\n⚠️ ARCA tiene {ultimo_arca} y el log no tiene ninguno."
+        return bloque
+
+    # El barrido arranca en el primero que el log conoce: los comprobantes
+    # anteriores al bot no son huecos, simplemente nunca estuvieron acá.
+    faltantes = [n for n in range(min(numeros), ultimo_arca + 1) if n not in numeros]
+    if not faltantes:
+        bloque += "\n✅ Sin huecos."
+        return bloque
+
+    listado = ", ".join(str(n) for n in faltantes[:20])
+    if len(faltantes) > 20:
+        listado += f" … (+{len(faltantes) - 20})"
+    bloque += (
+        f"\n⚠️ {len(faltantes)} sin registrar en el log: {listado}\n"
+        f"Están emitidos en ARCA. Bajalos de Mis Comprobantes y cargalos a mano."
+    )
+    return bloque
+
+
 @solo_autorizado
 async def cmd_ultima(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Reconciliacion: compara el ultimo comprobante en ARCA vs Supabase.
+    """Reconciliacion contra ARCA, por diferencia de conjuntos.
 
     Cubre la ventana de riesgo conocida: si el proceso se cae entre "ARCA dio
-    el CAE" y "guarde en Supabase", aca aparece el desfase.
+    el CAE" y "guarde en Supabase", aca aparece el faltante — este o cualquier
+    otro anterior que haya quedado sin registrar.
     """
-    try:
-        ultimo_arca = fac.get_afip().ElectronicBilling.getLastVoucher(
-            fac.PUNTO_DE_VENTA, fac.FACTURA_C
-        )
-    except Exception as e:
-        await update.message.reply_text(f"❌ No pude consultar ARCA:\n{e}")
-        return
-
-    ultimo_db = None
-    if fac.supabase is not None:
+    await update.message.reply_text("Reconciliando contra ARCA... ⏳")
+    bloques = []
+    for tipo, etiqueta in ((fac.FACTURA_C, "Factura C"),
+                           (fac.NOTA_CREDITO_C, "Nota de Crédito C")):
         try:
-            res = (
-                fac.supabase.table("facturas_emitidas")
-                .select("cbte_nro")
-                .eq("pto_vta", fac.PUNTO_DE_VENTA)
-                .eq("cbte_tipo", fac.FACTURA_C)
-                .order("cbte_nro", desc=True)
-                .limit(1)
-                .execute()
-            )
-            ultimo_db = res.data[0]["cbte_nro"] if res.data else 0
+            bloques.append(_reconciliar_tipo(tipo, etiqueta))
         except Exception as e:
-            await update.message.reply_text(f"❌ No pude consultar Supabase:\n{e}")
-            return
+            bloques.append(f"{etiqueta}\n❌ No pude reconciliar: {e}")
 
-    mensaje = (
-        f"Último comprobante (PV {fac.PUNTO_DE_VENTA}, Factura C):\n\n"
-        f"ARCA: {ultimo_arca}\n"
-        f"Supabase: {ultimo_db if ultimo_db is not None else 'sin configurar'}"
-    )
-    if ultimo_db is not None:
-        if ultimo_arca == ultimo_db:
-            mensaje += "\n\n✅ Todo reconciliado."
-        else:
-            mensaje += (
-                f"\n\n⚠️ Desfase de {ultimo_arca - ultimo_db}: hay comprobantes "
-                "en ARCA que no están en el log. Revisalos y cargalos a mano."
-            )
+    mensaje = f"Reconciliación (PV {fac.PUNTO_DE_VENTA}):\n\n" + "\n\n".join(bloques)
     if not fac.PRODUCTION:
         mensaje += (
-            "\n\n(Modo test: el CUIT de testing es compartido, el desfase "
-            "acá es normal y esperable.)"
+            "\n\n(Modo test: el CUIT de testing es compartido, los huecos "
+            "acá son normales y esperables.)"
         )
     await update.message.reply_text(mensaje)
 
@@ -1238,6 +1360,8 @@ def main():
         )
     if fac.supabase is None:
         logger.warning("Supabase no configurado: las facturas NO se van a guardar.")
+
+    socket.setdefaulttimeout(TIMEOUT_SOCKET_GLOBAL)
 
     app = ApplicationBuilder().token(TELEGRAM_TOKEN).post_init(_registrar_menu).build()
 
