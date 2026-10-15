@@ -57,8 +57,8 @@ fiscales.
 2. **Certificado digital de ARCA + punto de venta tipo Web Service** — es un
    trámite de una sola vez, sin darle tu clave fiscal a nadie:
    está paso a paso en [`fase0-setup-arca.md`](fase0-setup-arca.md).
-3. **Un bot de Telegram** — gratis con [@BotFather](https://t.me/BotFather).
-   Le hablás, creás un bot y te guardás el TOKEN en un lugar seguro. 
+3. **Un bot de Telegram** — gratis: buscá **@BotFather** en Telegram,
+   le hablás, creás un bot y te guardás el TOKEN en un lugar seguro.
 4. **Cuenta en [Afip SDK](https://afipsdk.com)** (plan free alcanza) — es el
    intermediario con los web services de ARCA. ⚠️ Leé la nota de seguridad.
 5. **Proyecto en [Supabase](https://supabase.com)** (plan free alcanza) para
@@ -79,9 +79,15 @@ Después:
 
 1. Corré `schema_facturacion.sql` completo en el SQL Editor de Supabase
    (es idempotente: crea las tablas y aplica las migraciones).
-2. Arrancá el bot: `.venv/bin/python bot_telegram.py`
-3. Mandale `/id` para conocer tu chat_id y ponelo en `MI_CHAT_ID` (sin esto
-   el bot no arranca: es la allowlist).
+2. Conseguí tu `chat_id` **antes** de arrancar (el bot no arranca sin él: es
+   la allowlist). Abrí Telegram, mandale cualquier mensaje a tu bot, y entrá a:
+   ```
+   https://api.telegram.org/bot<TU_TOKEN>/getUpdates
+   ```
+   Reemplazá `<TU_TOKEN>` por el token de @BotFather. Tu id aparece en
+   `"chat":{"id":...}`. Ponelo en `MI_CHAT_ID`. (Una vez configurado, el bot
+   también responde `/id` para reconfirmarlo.)
+3. Arrancá el bot: `.venv/bin/python bot_telegram.py`
 4. Probá con `PRODUCTION=false` (usa el entorno de homologación de ARCA con
    un CUIT de testing compartido — las facturas no son reales).
 5. Cuando todo cierre: `PRODUCTION=true` en el `.env` y emití una factura
